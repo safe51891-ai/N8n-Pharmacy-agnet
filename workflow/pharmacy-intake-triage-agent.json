@@ -1,0 +1,705 @@
+{
+  "name": "Pharmacy Intake Triage Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pharmacy-intake",
+        "responseMode": "responseNode",
+        "options": {
+          "binaryPropertyName": "data"
+        }
+      },
+      "id": "1f58eb68-c0d7-4c88-a726-71efd1cdf756",
+      "name": "Fax / document intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        336
+      ],
+      "webhookId": "f014b13f-963d-4c32-b618-782aa31d23eb"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nfor (const item of $input.all()) {\n  for (const [key, bin] of Object.entries(item.binary || {})) {\n    out.push({ json: { case_id: 'INT-' + Date.now().toString(36).toUpperCase() + '-' + out.length, file_name: bin.fileName || key, received_at: new Date().toISOString(), received_ms: Date.now() }, binary: { data: bin } });\n  }\n}\nif (!out.length) throw new Error('No document received. POST multipart/form-data with one or more fax/PDF/image files.');\nreturn out;"
+      },
+      "id": "7c7f4dae-bb5e-46ac-aece-f475302c2a86",
+      "name": "Split documents",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -176,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5001/v1/convert/file",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            },
+            {
+              "name": "to_formats",
+              "value": "md"
+            },
+            {
+              "name": "do_ocr",
+              "value": "true"
+            },
+            {
+              "name": "table_mode",
+              "value": "accurate"
+            },
+            {
+              "name": "image_export_mode",
+              "value": "placeholder"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 200
+            }
+          },
+          "timeout": 300000
+        }
+      },
+      "id": "82b992c7-4fa6-4bb0-b97c-4fecd3cfae6c",
+      "name": "OCR + layout (Docling)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        48,
+        336
+      ],
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Document text (Markdown from OCR + layout analysis):\n{{ $json.document && $json.document.md_content ? $json.document.md_content : '(OCR failed)' }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You triage documents received by a specialty pharmacy: faxed referrals, e-prescriptions, prior authorization (PA) forms, insurance cards and patient letters.\nReturn ONLY a JSON object (no markdown) with:\ndoc_type: one of \"new_prescription\", \"prior_authorization\", \"insurance_card\", \"patient_message\", \"other\"\nconfidence: number 0-1, how sure you are about doc_type AND the extracted fields (lower it for blurry or ambiguous text)\npatient: {first_name, last_name, dob}\nprescriber: {name, npi, phone, fax}\nmedication: {name, strength, quantity, refills, directions}\ninsurance: {payer, member_id, group, bin, pcn}\ndiagnosis_icd10, urgency (\"routine\" | \"urgent\" | null)\nsummary: one sentence describing the request WITHOUT patient names, dates of birth or IDs\nRules: copy values exactly as printed (do not fix or reformat NPIs, IDs or dates). Use null when a value is missing or unreadable. Never guess."
+            }
+          ]
+        }
+      },
+      "id": "2df2ac1a-de19-4164-84fc-95dc09f6a53e",
+      "name": "Classify + extract (LLM)",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.5,
+      "position": [
+        272,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "model": "openai/gpt-oss-120b",
+        "options": {
+          "temperature": 0
+        }
+      },
+      "id": "9e723b11-b84b-42e8-8adb-7d5a944ccda6",
+      "name": "Groq Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        272,
+        560
+      ],
+      "credentials": {
+        "groqApi": {
+          "id": "",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Deterministic checks + routing. The LLM only extracts; code decides.\nconst files = $('Split documents').all();\nconst CONF_MIN = 0.75;\nconst MIN_SAVED_PER_AUTO_DOC = 8; // assumption: manual intake/data entry minutes per document (tune with ops baseline)\nconst npiValid = n => { // CMS NPI check digit (Luhn with 80840 prefix)\n  n = String(n || '').replace(/\\D/g, ''); if (!/^\\d{10}$/.test(n)) return false;\n  let sum = 24; const b = n.slice(0, 9);\n  for (let i = 0; i < 9; i++) { let v = +b[8 - i]; if (i % 2 === 0) { v *= 2; if (v > 9) v -= 9; } sum += v; }\n  return (10 - (sum % 10)) % 10 === +n[9];\n};\nconst isoDate = d => { if (!d) return null; const s = String(d).trim(); if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return s;\n  const t = new Date(s); if (isNaN(t)) return null; return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0'); };\nconst ICD10 = /^[A-TV-Z][0-9][0-9AB](\\.?[0-9A-TV-Z]{1,4})?$/i;\nconst ref = s => { let h = 2166136261; for (const c of s) { h ^= c.charCodeAt(0); h = Math.imul(h, 16777619); } return 'P-' + (h >>> 0).toString(16).toUpperCase(); };\nconst REQUIRED = {\n  new_prescription: ['patient.first_name', 'patient.last_name', 'patient.dob', 'medication.name', 'prescriber.name', 'prescriber.npi'],\n  prior_authorization: ['patient.first_name', 'patient.last_name', 'patient.dob', 'medication.name', 'prescriber.npi', 'diagnosis_icd10', 'insurance.payer', 'insurance.member_id'],\n  insurance_card: ['patient.first_name', 'patient.last_name', 'insurance.payer', 'insurance.member_id'],\n  patient_message: [], other: []\n};\nconst get = (o, p) => p.split('.').reduce((a, k) => (a == null ? null : a[k]), o);\nreturn $input.all().map((item, i) => {\n  const f = files[i].json; const issues = []; let x = {};\n  try { const t = String(item.json.text || ''); x = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1)); }\n  catch (e) { issues.push('AI output was not valid JSON'); }\n  const docType = REQUIRED[x.doc_type] ? x.doc_type : 'other';\n  const conf = typeof x.confidence === 'number' ? x.confidence : 0;\n  const missing = (REQUIRED[docType] || []).filter(p => get(x, p) == null || get(x, p) === '');\n  if (missing.length) issues.push('missing: ' + missing.join(', '));\n  const npi = get(x, 'prescriber.npi'); const npiOk = npi ? npiValid(npi) : null;\n  if (npi && !npiOk) issues.push('prescriber NPI ' + npi + ' fails CMS check digit');\n  const dob = isoDate(get(x, 'patient.dob'));\n  if (get(x, 'patient.dob') && !dob) issues.push('unreadable date of birth');\n  if (dob) { const age = (Date.now() - new Date(dob)) / 3.15576e10; if (age < 0 || age > 120) issues.push('implausible date of birth ' + dob); }\n  if (x.diagnosis_icd10 && !ICD10.test(String(x.diagnosis_icd10).trim())) issues.push('ICD-10 code ' + x.diagnosis_icd10 + ' has invalid format');\n  if (conf < CONF_MIN) issues.push('low AI confidence ' + conf);\n\n  // Routing\n  let queue, next;\n  const dataProblem = missing.length || npiOk === false || issues.some(s => /date of birth|ICD-10/.test(s));\n  if (issues.some(s => /not valid JSON|low AI confidence/.test(s)) || docType === 'other') { queue = 'manual_review'; next = 'Intake specialist reviews document and classifies manually'; }\n  else if (dataProblem) { queue = 'missing_info_outreach'; next = 'Send outreach to prescriber office for: ' + issues.join('; '); }\n  else if (docType === 'prior_authorization') { queue = 'prior_authorization'; next = 'Submit PA to ' + get(x, 'insurance.payer') + (x.urgency === 'urgent' ? ' (URGENT, expedited review)' : ''); }\n  else if (docType === 'new_prescription' || docType === 'insurance_card') { queue = 'benefits_verification'; next = docType === 'insurance_card' ? 'Attach coverage to patient profile and run benefits check' : 'Run benefits verification' + (get(x, 'insurance.member_id') ? '' : ' (request insurance card from patient)'); }\n  else { queue = 'customer_care'; next = 'Customer care ticket: ' + (x.summary || 'patient message'); }\n\n  // Status updates from fixed templates (no AI-written promises, minimum necessary PHI)\n  const first = get(x, 'patient.first_name') || 'there';\n  const initials = ((get(x, 'patient.first_name') || '?')[0] + (get(x, 'patient.last_name') || '?')[0]).toUpperCase();\n  const med = get(x, 'medication.name') || 'your medication';\n  const msg = {\n    benefits_verification: 'Hi ' + first + ', we received your prescription for ' + med + ' and are verifying your insurance benefits. We will update you within 1 business day.',\n    prior_authorization: 'Prior authorization request received for patient ' + initials + ' (' + med + '). It is now in our PA queue; we will notify your office of the payer decision.',\n    missing_info_outreach: 'We received a document for patient ' + initials + ' but cannot proceed until we have: ' + (missing.join(', ') || issues.join('; ')) + '. Please reply or re-fax with the corrected information.',\n    manual_review: 'Internal: document needs manual classification by an intake specialist.',\n    customer_care: 'Hi ' + first + ', thanks for your message. A care team member will reply within 1 business day.'\n  }[queue];\n  const name = [get(x, 'patient.first_name'), get(x, 'patient.last_name')].filter(Boolean).join(' ');\n  return { json: {\n    case_id: f.case_id, received_at: f.received_at, file_name: f.file_name, doc_type: docType, confidence: conf,\n    queue, next_action: next, patient_name: name || null, patient_dob: dob, patient_ref: name ? ref((name + '|' + (dob || '')).toLowerCase()) : null,\n    medication: [get(x, 'medication.name'), get(x, 'medication.strength')].filter(Boolean).join(' ') || null,\n    prescriber_name: get(x, 'prescriber.name'), prescriber_npi: npi ? String(npi) : null, npi_valid: npiOk,\n    payer: get(x, 'insurance.payer'), member_id: get(x, 'insurance.member_id') ? String(get(x, 'insurance.member_id')) : null,\n    diagnosis_icd10: x.diagnosis_icd10 || null, issues: issues.join('; '), status_message: msg, extracted_json: JSON.stringify(x)\n  }};\n});"
+      },
+      "id": "e75b1fe1-9fbe-41a2-8e46-13aeb93e4b05",
+      "name": "Validate & route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        512,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "PUjRKTG5iGeNP93n",
+          "cachedResultName": "pharmacy_intake_cases"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "case_id",
+              "displayName": "case_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "file_name",
+              "displayName": "file_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "doc_type",
+              "displayName": "doc_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "queue",
+              "displayName": "queue",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "next_action",
+              "displayName": "next_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "patient_name",
+              "displayName": "patient_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "patient_dob",
+              "displayName": "patient_dob",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "patient_ref",
+              "displayName": "patient_ref",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "medication",
+              "displayName": "medication",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "prescriber_name",
+              "displayName": "prescriber_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "prescriber_npi",
+              "displayName": "prescriber_npi",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "npi_valid",
+              "displayName": "npi_valid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payer",
+              "displayName": "payer",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "member_id",
+              "displayName": "member_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "diagnosis_icd10",
+              "displayName": "diagnosis_icd10",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "issues",
+              "displayName": "issues",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status_message",
+              "displayName": "status_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "extracted_json",
+              "displayName": "extracted_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "829ad819-58b9-45eb-8d51-860b7f64be57",
+      "name": "Save intake case",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        736,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// KPI / observability row per document. No PHI: only case_id and metrics.\nconst files = $('Split documents').all();\nconst ocr = $('OCR + layout (Docling)').all();\nconst llm = $('Classify + extract (LLM)').all();\nconst MIN_SAVED_PER_AUTO_DOC = 8;\nconst SYSTEM_PROMPT_CHARS = 1100;\nreturn $input.all().map((item, i) => {\n  const c = item.json; const auto = c.queue !== 'manual_review';\n  const md = (ocr[i] && ocr[i].json.document && ocr[i].json.document.md_content) || '';\n  return { json: {\n    case_id: c.case_id, run_at: new Date().toISOString(), doc_type: c.doc_type, queue: c.queue,\n    auto_routed: auto, needs_human: c.queue === 'manual_review' || c.queue === 'missing_info_outreach',\n    issue_count: c.issues ? c.issues.split('; ').length : 0, confidence: c.confidence,\n    processing_ms: Date.now() - files[i].json.received_ms,\n    est_input_tokens: Math.round((md.length + SYSTEM_PROMPT_CHARS) / 4),\n    est_output_tokens: Math.round(String((llm[i] && llm[i].json.text) || '').length / 4),\n    model: 'groq/openai/gpt-oss-120b', est_minutes_saved: auto ? MIN_SAVED_PER_AUTO_DOC : 0\n  }};\n});"
+      },
+      "id": "dc303a9c-b6d5-4e3b-ad27-2e883b8747be",
+      "name": "Build KPI record",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "ePgQdpR3Wi1WiL2t",
+          "cachedResultName": "automation_runs"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "case_id",
+              "displayName": "case_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "run_at",
+              "displayName": "run_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "doc_type",
+              "displayName": "doc_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "queue",
+              "displayName": "queue",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "auto_routed",
+              "displayName": "auto_routed",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "needs_human",
+              "displayName": "needs_human",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "boolean",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "issue_count",
+              "displayName": "issue_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_ms",
+              "displayName": "processing_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "est_input_tokens",
+              "displayName": "est_input_tokens",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "est_output_tokens",
+              "displayName": "est_output_tokens",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "model",
+              "displayName": "model",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "est_minutes_saved",
+              "displayName": "est_minutes_saved",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "9657792c-3c24-4e2e-8ccd-31e5db440b9d",
+      "name": "Log run metrics",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1168,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $('Validate & route').all().map(i => ({ json: { case_id: i.json.case_id, file_name: i.json.file_name, doc_type: i.json.doc_type, queue: i.json.queue, next_action: i.json.next_action, issues: i.json.issues, status_message: i.json.status_message } }));"
+      },
+      "id": "8337f7d1-769e-47a3-85c6-d5d95918a94e",
+      "name": "Build response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1392,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {}
+      },
+      "id": "fcf99a46-910c-4fa5-a654-e92fcaebb77b",
+      "name": "Respond to sender",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1616,
+        336
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Pharmacy Intake Triage Agent\nFaxed referrals, e-Rx, PA forms, insurance cards and patient letters in \u2192 classified, extracted, validated and routed to the right ops queue with a status update drafted.\n\n**Queues:** benefits_verification \u00b7 prior_authorization \u00b7 missing_info_outreach \u00b7 customer_care \u00b7 manual_review\n\n**Guardrails:** LLM only extracts. Code checks NPI check digit (CMS), DOB, ICD-10 format, required fields per doc type and AI confidence \u2265 0.75. Status messages come from fixed templates (minimum necessary PHI).\n\n**KPIs logged per document (no PHI):** processing time, auto-routed vs human, issues, confidence, token estimate, minutes saved.\n\n\u26a0\ufe0f Demo uses synthetic patients only. Production: BAA-covered LLM endpoint, self-hosted OCR (Docling), audit logs.",
+        "height": 400,
+        "width": 520
+      },
+      "id": "d621800e-fa36-4801-8d07-806e2a524fdc",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -432,
+        -128
+      ]
+    }
+  ],
+  "connections": {
+    "Fax / document intake": {
+      "main": [
+        [
+          {
+            "node": "Split documents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split documents": {
+      "main": [
+        [
+          {
+            "node": "OCR + layout (Docling)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OCR + layout (Docling)": {
+      "main": [
+        [
+          {
+            "node": "Classify + extract (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Classify + extract (LLM)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify + extract (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Validate & route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & route": {
+      "main": [
+        [
+          {
+            "node": "Save intake case",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save intake case": {
+      "main": [
+        [
+          {
+            "node": "Build KPI record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build KPI record": {
+      "main": [
+        [
+          {
+            "node": "Log run metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log run metrics": {
+      "main": [
+        [
+          {
+            "node": "Build response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build response": {
+      "main": [
+        [
+          {
+            "node": "Respond to sender",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "nodeGroups": []
+}
